@@ -92,12 +92,52 @@ USER = [{"role": "user", "content": "x"}]
 
 
 def test_model_table():
-    assert set(models.MODELS) == {"gpt-6.1-sol", "gpt-6-luna", "muse-spark-1.3", "gemini-4-argon", "qwen3.8-27b"}
+    assert set(models.MODELS) == {"gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-terra", "muse-spark-1.3", "gemini-4-argon",
+                                  "qwen3.8-27b", "claude-sonnet-5-5", "claude-haiku-5-5"}
+    for name in ("claude-sonnet-5-5", "claude-haiku-5-5"):
+        assert models.MODELS[name].base_url == "https://api.anthropic.com/v1/"
+        assert models.MODELS[name].key_env == "CLAUDE_API_KEY"
     assert models.MODELS["qwen3.8-27b"].base_url == "https://openrouter.ai/api/v1"
     assert models.MODELS["qwen3.8-27b"].key_env == "OPENROUTER_API_KEY"
     assert SOL.base_url is None and SOL.key_env == "OPENAI_API_KEY"
     with pytest.raises(SystemExit):
         models.get_spec("gpt-4")
+
+
+def test_dashboard_prices_and_openrouter_provider():
+    price = {n: (s.price_in, s.price_out) for n, s in models.MODELS.items()}
+    assert price["gpt-6.1-sol"] == (2.0, 10.0)
+    assert price["gpt-6-luna"] == (0.1, 0.5)
+    assert price["gpt-5.6-terra"] == (2.0, 12.0)
+    assert price["claude-sonnet-5-5"] == (2.0, 10.0)
+    assert price["claude-haiku-5-5"] == (0.1, 0.5)
+    assert price["muse-spark-1.3"] == (1.25, 4.25)
+    assert price["qwen3.8-27b"] == (0.04, 1.35)
+    provider = models.MODELS["qwen3.8-27b"].extra_body["provider"]
+    assert provider["order"] == ["near-ai"] and provider["allow_fallbacks"] is True
+
+
+def test_ask_json_sends_extra_body_and_logs_token_details():
+    usage = SimpleNamespace(prompt_tokens=100, completion_tokens=40,
+                            prompt_tokens_details=SimpleNamespace(cached_tokens=64),
+                            completion_tokens_details=SimpleNamespace(reasoning_tokens=30))
+    calls = []
+
+    def create(**kw):
+        calls.append(kw)
+        msg = SimpleNamespace(content=GOOD, refusal=None)
+        return SimpleNamespace(id="r1", choices=[SimpleNamespace(message=msg)], usage=usage)
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    spec = dataclasses.replace(SOL, extra_body={"provider": {"order": ["x"]}})
+    log = []
+    out, summ = models.ask_json(client, spec, USER, schema.Generation, log.append)
+    assert out is not None and calls[0]["extra_body"] == {"provider": {"order": ["x"]}}
+    assert log[0]["usage"] == {"input_tokens": 100, "output_tokens": 40, "cached_tokens": 64, "reasoning_tokens": 30}
+    assert summ["reasoning_tokens"] == 30 and summ["cached_tokens"] == 64
+    fake = FakeClient(lambda kw: GOOD)
+    models.ask_json(fake, SOL, USER, schema.Generation, log.append)
+    assert "extra_body" not in fake.calls[0] and log[1]["usage"]["reasoning_tokens"] == 0
 
 
 def test_make_client_missing_key(monkeypatch):

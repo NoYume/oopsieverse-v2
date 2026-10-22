@@ -26,20 +26,29 @@ class ModelSpec:
     json_schema: bool = True        # strict json_schema; False = json_object + schema in the prompt
     price_in: float | None = None   # USD per 1M input tokens; None = unknown
     price_out: float | None = None
+    extra_body: dict | None = None  # provider-specific request fields (OpenRouter routing)
 
 
+# Prices from the provider dashboards, Oct 21, 2026 (Muse cached input is $0.15, not modelled).
+# Qwen goes to Near AI on OpenRouter: cheapest provider with a clean data policy and full uptime;
+# falls back to OpenRouter's default routing if it is down.
 MODELS: dict[str, ModelSpec] = {s.name: s for s in (
-    ModelSpec("gpt-6.1-sol", "gpt-6.1-sol", None, "OPENAI_API_KEY"),
-    ModelSpec("gpt-6-luna", "gpt-6-luna", None, "OPENAI_API_KEY"),
-    ModelSpec("muse-spark-1.3", "muse-spark-1.3",
-              "https://api.meta.ai/v1",  # unverified
-              "META_API_KEY"),
+    ModelSpec("gpt-6.1-sol", "gpt-6.1-sol", None, "OPENAI_API_KEY", price_in=2.0, price_out=10.0),
+    ModelSpec("gpt-6-luna", "gpt-6-luna", None, "OPENAI_API_KEY", price_in=0.1, price_out=0.5),
+    ModelSpec("gpt-5.6-terra", "gpt-5.6-terra", None, "OPENAI_API_KEY", price_in=2.0, price_out=12.0),
+    ModelSpec("muse-spark-1.3", "muse-spark-1.3", "https://api.meta.ai/v1", "META_API_KEY",
+              price_in=1.25, price_out=4.25),
     ModelSpec("gemini-4-argon", "gemini-4-argon",
               "https://generativelanguage.googleapis.com/v1beta/openai/",  # unverified for this model
               "GEMINI_API_KEY"),
-    ModelSpec("qwen3.8-27b",
-              "qwen/qwen3.8-27b",  # unverified OpenRouter id
-              "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
+    # Anthropic's OpenAI-compatible endpoint: strict JSON works, adaptive thinking does not (400).
+    ModelSpec("claude-sonnet-5-5", "claude-sonnet-5-5", "https://api.anthropic.com/v1/", "CLAUDE_API_KEY",
+              price_in=2.0, price_out=10.0),
+    ModelSpec("claude-haiku-5-5", "claude-haiku-5-5", "https://api.anthropic.com/v1/", "CLAUDE_API_KEY",
+              price_in=0.1, price_out=0.5),
+    ModelSpec("qwen3.8-27b", "qwen/qwen3.8-27b", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY",
+              price_in=0.04, price_out=1.35,
+              extra_body={"provider": {"order": ["near-ai"], "allow_fallbacks": True}}),
 )}
 
 MAX_ATTEMPTS = 3
@@ -102,17 +111,21 @@ def ask_json(client, spec: ModelSpec, messages: list[dict], model_cls: type[Base
     if not spec.json_schema:
         msgs.insert(0, {"role": "system", "content": "Reply with one JSON object matching this JSON schema:\n"
                                                      + json.dumps(json_schema_for(model_cls))})
-    summary = {"response_id": None, "attempts": 0, "input_tokens": 0, "output_tokens": 0, "error": None,
-               "api_error": False}  # api_error: the provider refused the call; a resume retries it
+    summary = {"response_id": None, "attempts": 0, "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0,
+               "reasoning_tokens": 0, "error": None, "api_error": False}  # api_error: the provider refused the call; a resume retries it
     fmt = response_format(spec, model_cls)
+    kwargs = dict(extra or {})
+    if spec.extra_body:
+        kwargs["extra_body"] = spec.extra_body
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         summary["attempts"] = attempt
         record = {"attempt": attempt, "model_id": spec.model_id, "messages": list(msgs), "reply": None,
-                  "response_id": None, "usage": {"input_tokens": 0, "output_tokens": 0}, "error": None}
+                  "response_id": None, "usage": {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0,
+                                                 "reasoning_tokens": 0}, "error": None}
         try:
             resp = client.chat.completions.create(model=spec.model_id, messages=msgs,
-                                                  response_format=fmt, **(extra or {}))
+                                                  response_format=fmt, **kwargs)
         except openai.APIError as exc:
             record["error"] = summary["error"] = f"{type(exc).__name__}: {exc}"
             summary["api_error"] = True
@@ -126,10 +139,15 @@ def ask_json(client, spec: ModelSpec, messages: list[dict], model_cls: type[Base
         usage = getattr(resp, "usage", None)
         tin = getattr(usage, "prompt_tokens", 0) or 0
         tout = getattr(usage, "completion_tokens", 0) or 0
+        cached = getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", 0) or 0
+        reasoning = getattr(getattr(usage, "completion_tokens_details", None), "reasoning_tokens", 0) or 0
         summary["input_tokens"] += tin
         summary["output_tokens"] += tout
+        summary["cached_tokens"] += cached
+        summary["reasoning_tokens"] += reasoning
         summary["response_id"] = record["response_id"] = getattr(resp, "id", None)
-        record.update(reply=text, usage={"input_tokens": tin, "output_tokens": tout})
+        record.update(reply=text, usage={"input_tokens": tin, "output_tokens": tout, "cached_tokens": cached,
+                                         "reasoning_tokens": reasoning})
 
         try:
             if malformed:
