@@ -21,11 +21,11 @@ def visible_pool(rows: list[dict], target_key: str) -> list[dict]:
 
 
 def pick_similar(client, spec, backend: str, target: dict, pool: list[dict], k: int,
-                 log) -> tuple[list[str], dict]:
+                 log, feedback: str | None = None) -> tuple[list[str], dict]:
     """The model's k most similar pool objects, as entry_keys in its order ([] on failure)."""
     names = [r["display_name"] for r in pool]
     by_name = {r["display_name"]: r["entry_key"] for r in pool}
-    messages = prompts.selection_messages(backend, target["display_name"], names, k)
+    messages = prompts.selection_messages(backend, target["display_name"], names, k, feedback)
     parsed, summary = ask_json(client, spec, messages, selection_model(names, k), log)
     if parsed is None:
         return [], summary

@@ -92,7 +92,7 @@ USER = [{"role": "user", "content": "x"}]
 
 
 def test_model_table():
-    assert set(models.MODELS) == {"gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-terra", "muse-spark-1.3", "gemini-4-argon",
+    assert set(models.MODELS) == {"gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-terra", "muse-spark-1.3", "gemini-4-argon", "gemini-3.5-flash-lite",
                                   "qwen3.8-27b", "claude-sonnet-5-5", "claude-haiku-5-5"}
     for name in ("claude-sonnet-5-5", "claude-haiku-5-5"):
         assert models.MODELS[name].base_url == "https://api.anthropic.com/v1/"
@@ -226,6 +226,20 @@ def test_pick_similar_retries_bad_count_then_fails():
     fake = FakeClient(lambda kw: json.dumps({"similar": [pool[0]["display_name"]] * 2}))
     keys, summ = context.pick_similar(fake, SOL, "robocasa", _row(RS, "plate"), pool, 5, lambda r: None)
     assert keys == [] and summ["error"] and len(fake.calls) == 3
+
+
+def test_feedback_reaches_both_prompts_with_earlier_numbers_and_result():
+    rounds = [{"params": {"damage_threshold": 60.0, "damage_scale": 2.0, "impact_damage_sensitivity": 1.0,
+                          "qs_damage_sensitivity": 0.2},
+               "summary": {"final_health": {"cup": 100.0, "PandaOmron": 90.0},
+                           "peak_forces": {"cup": {"impact_forces": 12.0, "filtered_qs_forces": 3.0}}},
+               "feedback": "that cup isn't breaking as easily as it should"}]
+    block = prompts.feedback_block("cup", rounds)
+    assert "damage_threshold=60.0" in block and "final health 100.0" in block and "peak impact force 12.0" in block
+    assert "isn't breaking" in block and "PandaOmron" not in block
+    assert block in prompts.generation_messages("robocasa", "cup", [_row(RS, "mug")], block)[1]["content"]
+    assert block in prompts.selection_messages("robocasa", "cup", ["mug"], 1, block)[1]["content"]
+    assert "Earlier attempts" not in json.dumps(prompts.generation_messages("robocasa", "cup", [_row(RS, "mug")]))
 
 
 def test_generation_prompt_lists_exemplars_and_target():

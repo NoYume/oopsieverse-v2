@@ -24,14 +24,37 @@ PARAM_MEANINGS = {
 }
 
 
-def selection_messages(backend: str, target_name: str, pool_names: list[str], k: int) -> list[dict]:
+def feedback_block(target_key: str, rounds: list[dict]) -> str:
+    """Earlier attempts at one object: their numbers, what they did in simulation, what the human said."""
+    lines = ["Earlier attempts at this object, each played back in simulation and judged by a human. "
+             "Per step: D = impact_damage_sensitivity * impact force + qs_damage_sensitivity * pushing force; "
+             "health lost = max(0, D - damage_threshold) * damage_scale. Health starts at 100.", ""]
+    for i, r in enumerate(rounds, start=1):
+        lines.append(f"Attempt {i}: " + ", ".join(f"{p}={r['params'][p]!r}" for p in PARAM_NAMES))
+        health = (r.get("summary") or {}).get("final_health", {})
+        peaks = (r.get("summary") or {}).get("peak_forces", {})
+        for obj in [o for o in health if target_key in o.lower()] or list(health):
+            f = peaks.get(obj, {})
+            lines.append(f"Result for {obj}: final health {health[obj]:.1f}, peak impact force "
+                         f"{f.get('impact_forces', 0.0):.1f}, peak pushing force {f.get('filtered_qs_forces', 0.0):.1f}")
+        if r.get("feedback"):
+            lines.append(f"Human feedback: {r['feedback']}")
+        lines.append("")
+    lines.append("Change the numbers so the object behaves as the latest feedback asks; "
+                 "where the feedback and the similar objects disagree, follow the feedback.")
+    return "\n".join(lines)
+
+
+def selection_messages(backend: str, target_name: str, pool_names: list[str], k: int,
+                       feedback: str | None = None) -> list[dict]:
     listing = "\n".join(f"- {n}" for n in pool_names)
+    note = f"\n\n{feedback}" if feedback else ""
     return [
         {"role": "system", "content": "You help set damage parameters for objects in a robot simulator."},
         {"role": "user", "content": (
             f"Object: {target_name}\n\n"
             f"From the list below, pick the {k} objects that would break most like a {target_name} "
-            f"(material, fragility, size). Use names from the list only.\n\n{listing}"
+            f"(material, fragility, size). Use names from the list only.\n\n{listing}{note}"
         )},
     ]
 
@@ -40,16 +63,18 @@ def _exemplar_line(row: dict) -> str:
     return f"{row['display_name']}: " + ", ".join(f"{p}={float(row[p])!r}" for p in PARAM_NAMES)
 
 
-def generation_messages(backend: str, target_name: str, exemplars: list[dict]) -> list[dict]:
+def generation_messages(backend: str, target_name: str, exemplars: list[dict],
+                        feedback: str | None = None) -> list[dict]:
     meanings = "\n".join(f"- {p}: {PARAM_MEANINGS[p]}" for p in PARAM_NAMES)
     examples = "\n".join(_exemplar_line(r) for r in exemplars)
+    note = f"{feedback}\n\n" if feedback else ""
     return [
         {"role": "system", "content": "You set damage parameters for objects in a robot simulator. "
                                       "Answer with the JSON schema only; never ask a question."},
         {"role": "user", "content": (
             f"{SIMULATOR_NOTE[backend]}\n\nParameters:\n{meanings}\n\n"
             f"Hand-tuned values for similar objects:\n{examples}\n\n"
-            f"Give the four parameters for: {target_name}\n"
+            f"{note}Give the four parameters for: {target_name}\n"
             "Also give a one-sentence reasoning."
         )},
     ]

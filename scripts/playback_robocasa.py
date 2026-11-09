@@ -47,6 +47,9 @@ from damagesim.utils.misc_utils import (
 from damagesim.utils.playback_schema import canonicalize_traj_obs, list_playback_cameras, cam_rgb_key, cam_seg_key
 from damagesim.utils.visualization import save_rgb_health_video_with_overlay
 from damagesim.robosuite.damageable_env import normalize_class_name
+from damagesim.robosuite.params import OBJECT_PARAMS
+
+matplotlib.use("Agg")  # damagesim.utils.visualization switches to TkAgg on import; Tk crashes here on macOS
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -273,7 +276,7 @@ Examples:
     parser.add_argument("--input", required=True, help="Path to collected (teleop) HDF5 file")
     parser.add_argument("--output", required=True, help="Path for playback (rendered) HDF5 output file")
     parser.add_argument("--env", required=True, help="Environment name (e.g. serve_pastry)")
-    parser.add_argument("--camera", default="all_cameras", help="Camera(s) to render (default: all_cameras)")
+    parser.add_argument("--camera", default="all_cameras", help="Camera to render, 'task' for the task's own camera, or all_cameras (default)")
     parser.add_argument("--width", type=int, default=256, help="Frame width (default: 256)")
     parser.add_argument("--height", type=int, default=256, help="Frame height (default: 256)")
     parser.add_argument("--low-dim", action="store_true", help="Use low-dimensional observations")
@@ -281,12 +284,20 @@ Examples:
     parser.add_argument("--demo_ids", nargs="*", type=int, default=None, help="Specific demo IDs to playback (e.g. 0 3 for demo_0, demo_3).")
     parser.add_argument("--visualize", action="store_true", help="Render and save videos after playback")
     parser.add_argument("--metrics", action="store_true", help="Compute and print health metrics after playback")
+    parser.add_argument("--headless", action="store_true", help="No MuJoCo viewer window (it needs mjpython on macOS)")
+    parser.add_argument("--param-overrides", help='JSON file replacing mechanical params: {"egg": {"damage_threshold": 5.0}}')
+    parser.add_argument("--summary-json", help="With --metrics: write final health and peak forces per object to this file")
     return parser
 
 
 def main():
     parser = create_parser()
     args = parser.parse_args()
+
+    if args.param_overrides:
+        with open(args.param_overrides) as f:
+            for obj_key, numbers in json.load(f).items():
+                OBJECT_PARAMS[obj_key]["mechanical"].update(numbers)
 
     if args.playback:
         if not os.path.exists(args.input):
@@ -303,7 +314,9 @@ def main():
             print(f"Available environments: {', '.join(EnvironmentRegistry.list_envs())}")
             return
 
-        if args.camera == "all_cameras":
+        if args.camera == "task":
+            camera_names = [env_config.camera_name]
+        elif args.camera == "all_cameras":
             if env_config.playback_cameras:
                 camera_names = env_config.playback_cameras
             else:
@@ -355,7 +368,7 @@ def main():
             robots=env_config.robot,
             controller_configs=load_composite_controller_config(robot=env_config.robot),
             translucent_robot=False,
-            has_renderer=True,
+            has_renderer=not args.headless,
             has_offscreen_renderer=True,
             render_camera=env_config.camera_name,
             ignore_done=True,
@@ -411,6 +424,7 @@ def main():
         final_env_healths = []
         task_completions = []
         safe_task_completions = []
+        peak_forces = defaultdict(lambda: defaultdict(float))
 
         for demo_name in sorted(f["data"].keys()):
             print(f"Episode: {demo_name}")
@@ -435,6 +449,13 @@ def main():
             force_keys = DEFAULT_FORCE_KEYS.copy()
 
             if args.metrics:
+                for entry in damage_info_entries:
+                    for obj_name, links in entry.items():
+                        for link_info in links.values():
+                            mech = link_info.get("mechanical", {})
+                            for fk in force_keys:
+                                peak_forces[obj_name][fk] = max(peak_forces[obj_name][fk], float(mech.get(fk, 0.0)))
+
                 current_env_health = 0.0
                 counted_objects = 0
                 for obj_name in target_objects_health:
@@ -561,6 +582,12 @@ def main():
         n_safe = sum(safe_task_completions)
         print(f"  Task completion: {n_success} / {total_eps} ({100.0 * n_success / max(total_eps, 1):.1f}%)")
         print(f"  Safe task completion: {n_safe} / {total_eps} ({100.0 * n_safe / max(total_eps, 1):.1f}%)")
+        if args.summary_json:
+            with open(args.summary_json, "w") as f:
+                json.dump({
+                    "final_health": {k: float(np.mean(v)) for k, v in final_obj_healths.items()},
+                    "peak_forces": peak_forces,
+                }, f, indent=2)
 
     print("\nPlayback complete.")
 

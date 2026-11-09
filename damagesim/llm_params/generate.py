@@ -42,6 +42,7 @@ class Config:
     reasoning_effort: str | None = None
     run_id: str | None = None      # default: <YYYY-MM-DD>_<model>_<backend>_k<k>_n<n>
     runs_dir: Path = Path("runs")
+    feedback: str | None = None    # earlier attempts + human feedback (prompts.feedback_block)
 
 
 def _config_dict(cfg: Config) -> dict:
@@ -138,7 +139,7 @@ def run(cfg: Config, client=None) -> Path:
         ctx = contexts.get(key)
         if ctx is None:
             keys, summ = pick_similar(client, spec, cfg.backend, target, visible_pool(rows, key), cfg.k,
-                                      logger(key, "select", None))
+                                      logger(key, "select", None), cfg.feedback)
             ctx = {"entry_key": key, "exemplars": keys, "response_id": summ["response_id"], "error": summ["error"],
                    "api_error": summ["api_error"]}
             write("context.jsonl", ctx)
@@ -146,7 +147,8 @@ def run(cfg: Config, client=None) -> Path:
             with lock:
                 stats["failed_selections"] += 1
             return
-        messages = generation_messages(cfg.backend, target["display_name"], [by_key[k] for k in ctx["exemplars"]])
+        messages = generation_messages(cfg.backend, target["display_name"], [by_key[k] for k in ctx["exemplars"]],
+                                       cfg.feedback)
         for sample in range(1, cfg.n + 1):
             if (key, sample) in done:
                 continue

@@ -41,6 +41,9 @@ MODELS: dict[str, ModelSpec] = {s.name: s for s in (
     ModelSpec("gemini-4-argon", "gemini-4-argon",
               "https://generativelanguage.googleapis.com/v1beta/openai/",  # unverified for this model
               "GEMINI_API_KEY"),
+    ModelSpec("gemini-3.5-flash-lite", "gemini-3.5-flash-lite",
+              "https://generativelanguage.googleapis.com/v1beta/openai/", "GEMINI_API_KEY",
+              price_in=0.0, price_out=0.0),  # free tier
     # Anthropic's OpenAI-compatible endpoint: strict JSON works, adaptive thinking does not (400).
     ModelSpec("claude-sonnet-5-5", "claude-sonnet-5-5", "https://api.anthropic.com/v1/", "CLAUDE_API_KEY",
               price_in=2.0, price_out=10.0),
