@@ -242,6 +242,24 @@ def test_feedback_reaches_both_prompts_with_earlier_numbers_and_result():
     assert "Earlier attempts" not in json.dumps(prompts.generation_messages("robocasa", "cup", [_row(RS, "mug")]))
 
 
+def _b1k_round(health):
+    return [{"params": {"damage_threshold": 150.0, "damage_scale": 100.0, "impact_damage_sensitivity": 0.1,
+                        "qs_damage_sensitivity": 0.1},
+             "summary": {"final_health": health, "peak_forces": {"book": {"impact_forces": 30.0}}},
+             "feedback": "the flour bag should tear when dropped"}]
+
+
+def test_feedback_block_uses_health_names_for_b1k():
+    block = prompts.feedback_block("bag_of_flour", _b1k_round({"book": 100.0, "robot0": 95.0}), health_names=["book"])
+    assert "Result for book: final health 100.0" in block and "peak impact force 30.0" in block
+    assert "robot0" not in block
+
+
+def test_feedback_block_says_not_recorded_instead_of_listing_everything():
+    block = prompts.feedback_block("bag_of_flour", _b1k_round({"robot0": 95.0}), health_names=["book"])
+    assert "Result for book: not recorded" in block and "robot0" not in block
+
+
 def test_generation_prompt_lists_exemplars_and_target():
     ex = [_row(RS, "mug"), _row(RS, "wine")]
     text = json.dumps(prompts.generation_messages("robocasa", "plate", ex))
@@ -340,3 +358,10 @@ def test_ask_json_malformed_200_reply_is_retried_not_raised():
     log = []
     out, summ = models.ask_json(fake, SOL, USER, schema.Generation, log.append)
     assert out is None and summ["attempts"] == 3 and len(log) == 3 and "malformed" in log[0]["error"]
+
+
+def test_feedback_block_says_not_recorded_for_a_missing_force():
+    rounds = _b1k_round({"book": 100.0})
+    rounds[0]["summary"]["peak_forces"] = {"book": {"filtered_qs_forces": 4.0}}
+    block = prompts.feedback_block("bag_of_flour", rounds, health_names=["book"])
+    assert "peak impact force not recorded" in block and "peak pushing force 4.0" in block
