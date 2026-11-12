@@ -2,7 +2,7 @@
 Leave-one-out generation: for each target, the model picks k similar visible objects once,
 then gives the four mechanical numbers n times from their hand-tuned values.
 
-    python -m damagesim.llm_params.generate --model gpt-6.1-sol --backend robocasa
+    python -m damagesim.llm_params.generate --model gpt-6.1-sol --backend omnigibson
 
 Writes runs/<run_id>/: config.json, context.jsonl, generations.jsonl, requests.jsonl.
 Rerunning the same command resumes: finished work is skipped.
@@ -33,7 +33,7 @@ _NOT_COMPARED = {"workers", "run_id", "runs_dir"}  # may differ when resuming
 @dataclass
 class Config:
     model: str = "gpt-6.1-sol"
-    backend: Literal["robocasa", "omnigibson"] = "robocasa"
+    backend: Literal["robocasa", "omnigibson"] = "omnigibson"  # BEHAVIOR-1K is the main supported sim
     n: int = 5                     # generations per target
     k: int = 5                     # exemplars per target
     targets: tuple[str, ...] = ()  # empty = every non-lockbox target

@@ -9,7 +9,8 @@ LLM/VLM prediction of DamageSim parameters.
 - ``generate``: the leave-one-out runner (``python -m damagesim.llm_params.generate``).
 - ``score``: metrics, baselines and Gate 1 checks (``python -m damagesim.llm_params.score``).
 - ``feedback_ui``: local page for generate, playback, human feedback, regenerate
-  (``python -m damagesim.llm_params.feedback_ui``); playback runs as a subprocess.
+  (``python -m damagesim.llm_params.feedback_ui``; BEHAVIOR-1K by default, ``--sim robocasa`` for
+  RoboCasa); playback runs as a subprocess.
 
 Prediction modules in this package are simulator-free; only ``replay/`` and
 ``render/`` (added later) import a simulator and run inside a backend env.
