@@ -582,6 +582,7 @@ def run_compute_metrics(args, task_cfg):
     final_env_healths: list = []
     task_completions: list = []
     safe_task_completions: list = []
+    per_demo_forces: list = []
 
     for demo_key in sorted(f["data"].keys()):
         if not demo_key.startswith("demo_"):
@@ -595,6 +596,12 @@ def run_compute_metrics(args, task_cfg):
             task_cfg.target_objects_health_with_links,
             task_cfg.target_objects_health,
         )
+        if args.summary_json:
+            # Every health-tracked link and both keys, not the task's plot selection: some tasks plot
+            # only pushing forces, and a force left out would read as zero in the feedback prompt.
+            links = list(dict.fromkeys(task_cfg.target_objects_health_with_links + task_cfg.target_objects_forces))
+            per_demo_forces.append(extract_forces_from_hdf5(
+                f, demo_key, links, ["impact_forces", "filtered_qs_forces"]))
 
         print(f"\nEpisode {demo_idx}:")
         env_health = 0.0
@@ -645,6 +652,12 @@ def run_compute_metrics(args, task_cfg):
 
     f.close()
 
+    if args.summary_json:
+        from damagesim.llm_params.playback_io import summarize
+
+        with open(args.summary_json, "w") as out:
+            json.dump(summarize(final_obj_healths, per_demo_forces), out, indent=2)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # MAIN
@@ -673,6 +686,8 @@ def parse_args():
     parser.add_argument("--low_resolution", action="store_true", help="Use 256×256 images.")
     parser.add_argument("--camera_name", type=str, default="external_sensor0", help="Camera for visualisation.")
     parser.add_argument("--skip_save_images", action="store_true", help="Save images from playback.")
+    parser.add_argument("--param-overrides", help='JSON file replacing mechanical params: {"bag_of_flour": {"damage_threshold": 5.0}}')
+    parser.add_argument("--summary-json", help="With --compute_metrics: write final health and peak forces per object to this file")
 
     return parser.parse_args()
 
@@ -692,6 +707,20 @@ def main():
     if not any([args.playback, args.visualize, args.compute_metrics]):
         print("Nothing to do. Specify at least one of: --playback  --visualize  --compute_metrics")
         sys.exit(0)
+    if args.summary_json and not args.compute_metrics:
+        sys.exit("--summary-json needs --compute_metrics")
+
+    if args.param_overrides:
+        # Objects read PARAMS when the env is built, so this must come before run_playback.
+        from damagesim.llm_params.playback_io import apply_overrides
+        from damagesim.omnigibson.params.damage_params import PARAMS
+
+        with open(args.param_overrides) as f:
+            overrides = json.load(f)
+        try:
+            apply_overrides(PARAMS, overrides)
+        except ValueError as exc:
+            sys.exit(f"--param-overrides: {exc}")
 
     if args.playback:
         run_playback(args, task_cfg, task_mod)
