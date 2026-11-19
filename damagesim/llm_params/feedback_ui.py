@@ -30,6 +30,7 @@ from typing import Callable
 
 from damagesim.llm_params import generate, ground_truth as gt, prompts
 from damagesim.llm_params.models import MODELS
+from damagesim.llm_params.playback_io import TUNED_PARAMS_PATH, save_tuned
 from damagesim.llm_params.schema import PARAM_NAMES
 
 ROOT = gt.REPO_ROOT
@@ -194,31 +195,39 @@ def generate_round(session: dict, model: str, n: int, k: int, client=None) -> di
     params, details = summarize_run(run_dir)
     if params is None:
         raise RuntimeError(f"no valid generation: {details['error']}")
-    new = {"model": model, "params": params, **details, "run_dir": str(run_dir), "summary": None, "video": None, "feedback": None}
+    new = {"model": model, "params": params, **details, "run_dir": str(run_dir), "playbacks": None, "feedback": None}
     rounds.append(new)
     return new
 
 
 def playback_round(session: dict, on_line=lambda line: None) -> None:
-    """Replay the session's demo with the latest round's params; fills in its summary and video."""
+    """Replay every session demo with the latest round's params; fills in one playback per demo."""
     sim, r = SIMS[session["sim"]], session["rounds"][-1]
     run_dir = Path(r["run_dir"])
-    overrides, summary = run_dir / "params.json", run_dir / "playback_summary.json"
+    overrides = run_dir / "params.json"
     overrides.write_text(json.dumps({session["object"]: r["params"]}, indent=2))
-    output = run_dir / "playback_data/playback.hdf5"
-    output.parent.mkdir(parents=True, exist_ok=True)  # OmniGibson's writer won't create it
-    cmd = sim.playback_cmd(session, run_dir, overrides, summary)
-    tail = []
-    with subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
-        for line in proc.stdout:
-            tail = (tail + [line.rstrip()])[-15:]
-            on_line(line.strip())
-    output.unlink(missing_ok=True)  # one camera is still hundreds of MB; the video and summary are what we keep
-    video = sim.video_path(run_dir, session["demo"]["demo_id"])
-    if proc.returncode != 0 or not summary.exists() or not video.exists():
-        raise RuntimeError("playback failed:\n" + "\n".join(tail))
-    r["summary"] = json.loads(summary.read_text())
-    r["video"] = str(video)
+    plays = []
+    for j, demo in enumerate(session["demos"]):
+        demo_dir, prefix = run_dir / f"demo{j}", f"demo {j + 1}/{len(session['demos'])}: "
+        summary, output = demo_dir / "playback_summary.json", demo_dir / "playback_data/playback.hdf5"
+        output.parent.mkdir(parents=True, exist_ok=True)  # OmniGibson's writer won't create it
+        cmd = sim.playback_cmd({**session, "demo": demo}, demo_dir, overrides, summary)
+        tail = []
+        with subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
+            for line in proc.stdout:
+                tail = (tail + [line.rstrip()])[-15:]
+                on_line(prefix + line.strip())
+        output.unlink(missing_ok=True)  # one camera is still hundreds of MB; the video and summary are what we keep
+        video = sim.video_path(demo_dir, demo["demo_id"])
+        if proc.returncode != 0 or not summary.exists() or not video.exists():
+            raise RuntimeError(f"playback of {demo['label']} failed:\n" + "\n".join(tail))
+        plays.append({"label": demo["label"], "summary": json.loads(summary.read_text()), "video": str(video)})
+    r["playbacks"] = plays
+
+
+def save_params(key: str, params: dict) -> None:
+    """Keep the tuned numbers in data/tuned_params.json; the hand-tuned table is left alone."""
+    save_tuned(key, params)
 
 
 class App:
@@ -233,6 +242,7 @@ class App:
 
     def options(self) -> dict:
         return {"demos": self.demos, "default_model": self.default_model, "download": SIMS[self.sim].download,
+                "sim": self.sim,
                 "models": [{"name": s.name, "has_key": bool(os.environ.get(s.key_env)), "key_env": s.key_env}
                            for s in MODELS.values()]}
 
@@ -266,14 +276,19 @@ class App:
         return 202, {}
 
     def generate(self, body: dict) -> tuple[int, dict]:
-        demo = next((d for d in self.demos if d["path"] == body.get("path") and d["demo_id"] == body.get("demo_id")), None)
-        obj = next((o for o in demo["objects"] if o["key"] == body.get("object")), None) if demo else None
+        asked = body.get("demos") if isinstance(body.get("demos"), list) else []
+        demos = [next((d for d in self.demos if d["path"] == a.get("path") and d["demo_id"] == a.get("demo_id")), None)
+                 for a in asked if isinstance(a, dict)]
+        if not demos or None in demos or len({d["task"] for d in demos}) != 1:
+            return 400, {"error": "pick one or more demos of one task"}
+        demo = demos[0]
+        obj = next((o for o in demo["objects"] if o["key"] == body.get("object")), None)
         if obj is None:
-            return 400, {"error": "unknown demo or object"}
+            return 400, {"error": "unknown object for this task"}
         model = body.get("model")
         if error := self._model_error(model):
             return 400, {"error": error}
-        session = {"sim": self.sim, "object": obj["key"], "health_names": obj["health_names"], "demo": demo, "rounds": [],
+        session = {"sim": self.sim, "object": obj["key"], "health_names": obj["health_names"], "demos": demos, "rounds": [],
                    "dir": str(ROOT / "runs/feedback" / f"{time.strftime('%Y%m%d_%H%M%S')}_{demo['task']}_{body['object']}")}
         Path(session["dir"]).mkdir(parents=True)
         self.session = session
@@ -288,7 +303,7 @@ class App:
         text = str(body.get("text", "")).strip()
         if not text:
             return 400, {"error": "say what looked wrong"}
-        if not self.session or not self.session["rounds"] or not self.session["rounds"][-1]["summary"]:
+        if not self.session or not self.session["rounds"] or not self.session["rounds"][-1]["playbacks"]:
             return 400, {"error": "play back first"}
         model = body.get("model")
         if error := self._model_error(model):
@@ -299,6 +314,25 @@ class App:
             generate_round(self.session, model, self.n, self.k)
 
         return self._start("regenerating with feedback", job)
+
+    def save(self) -> tuple[int, dict]:
+        """Save the latest played-back round's numbers to data/tuned_params.json (RoboCasa only)."""
+        s = self.session
+        if not s or s["sim"] != "robocasa":
+            return 400, {"error": "saving is RoboCasa-only"}
+        if not s["rounds"] or not s["rounds"][-1]["playbacks"]:
+            return 400, {"error": "play back first"}
+        with self.lock:
+            if self.busy:
+                return 409, {"error": f"still busy: {self.busy}"}
+            r = s["rounds"][-1]
+            try:
+                save_params(s["object"], r["params"])
+            except (OSError, ValueError) as exc:
+                return 500, {"error": f"not saved: {exc}"}
+            r["saved"] = True
+            self._save()
+        return 200, {}
 
     def _set_status(self, line: str) -> None:
         self.status = line
@@ -350,11 +384,12 @@ def make_handler(app: App):
                 self._json(200, app.state())
             elif self.path == "/api/options":
                 self._json(200, app.options())
-            elif m := re.fullmatch(r"/video/(\d+)(\?.*)?", self.path):
+            elif m := re.fullmatch(r"/video/(\d+)/(\d+)(\?.*)?", self.path):
                 rounds = app.session["rounds"] if app.session else []
-                i = int(m[1])
-                if i < len(rounds) and rounds[i]["video"]:
-                    self._video(rounds[i]["video"])  # only paths the server itself recorded
+                i, j = int(m[1]), int(m[2])
+                plays = (rounds[i]["playbacks"] or []) if i < len(rounds) else []
+                if j < len(plays):
+                    self._video(plays[j]["video"])  # only paths the server itself recorded
                 else:
                     self._json(404, {"error": "no video"})
             else:
@@ -368,7 +403,7 @@ def make_handler(app: App):
                 return self._json(403, {"error": "forbidden"})
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
             routes = {"/api/generate": lambda: app.generate(body), "/api/playback": app.playback,
-                      "/api/feedback": lambda: app.feedback(body)}
+                      "/api/feedback": lambda: app.feedback(body), "/api/save": app.save}
             if self.path not in routes:
                 return self._json(404, {"error": "not found"})
             self._json(*routes[self.path]())
@@ -409,17 +444,24 @@ table { border-collapse:collapse; margin:6px 0 10px; font-variant-numeric:tabula
 td, th { padding:2px 16px 2px 0; text-align:left; font-weight:400; } th { color:var(--muted); }
 video { width:100%; border-radius:6px; background:#000; margin-top:6px; }
 .said { border-left:3px solid var(--accent); padding-left:10px; margin:8px 0; }
+h3 { font-size:14px; margin:14px 0 2px; }
+.checks { display:flex; flex-wrap:wrap; gap:4px 16px; margin-top:4px; }
+.checks label { flex-direction:row; align-items:center; gap:6px; color:var(--fg); font-size:14px; }
+.saved { color:var(--accent); font-size:13px; margin:8px 0; }
 </style></head><body>
 <div class="layout" id="layout">
 <div id="controls">
 <h1>Damage param feedback</h1>
 <div class="row">
-  <label>Demo <select id="demo"></select></label>
+  <label>Task <select id="task"></select></label>
   <label>Object <select id="object"></select></label>
   <label>Model <select id="model"></select></label>
   <button id="generate" class="primary">Generate properties</button>
   <button id="playback">Play back</button>
+  <button id="save" hidden>Save tuned values</button>
 </div>
+<div class="muted" style="font-size:13px">Demos played back each round</div>
+<div id="demoList" class="checks"></div>
 <div id="status" class="muted" role="status"></div>
 <div id="error"></div>
 <div id="feedbackBox" hidden>
@@ -458,15 +500,15 @@ function renderRound(r, i, rounds) {
   d.append(table(["Parameter", "Value"], Object.entries(r.params).map(([k, v]) => [k, String(+v.toPrecision(4))])));
   d.append(el("div", r.model + ": median of " + r.samples + (r.samples === 1 ? " sample" : " samples") + ". Similar objects: " + r.exemplars.join(", "), "muted"));
   if (r.reasoning) d.append(el("div", r.reasoning, "muted"));
-  if (r.summary) {
-    const peaks = r.summary.peak_forces;
-    d.append(table(["Object", "Final health", "Peak impact", "Peak pushing"], Object.entries(r.summary.final_health).map(([o, h]) => [
+  if (r.saved) d.append(el("div", "Saved to data/tuned_params.json. RoboCasa now uses these values for this object; the hand-tuned table and the benchmark are unchanged.", "saved"));
+  (r.playbacks || []).forEach((p, j) => {
+    const peaks = p.summary.peak_forces;
+    d.append(el("h3", p.label));
+    d.append(table(["Object", "Final health", "Peak impact", "Peak pushing"], Object.entries(p.summary.final_health).map(([o, h]) => [
       o, h.toFixed(1) + "%", force(peaks[o], "impact_forces"), force(peaks[o], "filtered_qs_forces")])));
-  }
-  if (r.video) {
-    const v = el("video"); v.controls = true; v.preload = "metadata"; v.src = "/video/" + i + "?v=" + encodeURIComponent(r.run_dir);
+    const v = el("video"); v.controls = true; v.preload = "metadata"; v.src = "/video/" + i + "/" + j + "?v=" + encodeURIComponent(r.run_dir);
     d.append(v);
-  }
+  });
   if (r.feedback && i === rounds.length - 1) d.append(el("div", "Not applied yet: " + r.feedback, "said"));
   return d;
 }
@@ -489,9 +531,14 @@ function renderDiff(prev, cur, i) {
   Object.keys(cur.params).forEach(p => d.append(renderParam(p, prev.params[p], cur.params[p])));
   return d;
 }
-function fillObjects() {
-  const d = demos[+$("demo").value];
-  $("object").replaceChildren(...(d ? d.objects : []).map(o => { const e = el("option", o.key); e.value = o.key; return e; }));
+function fillTask() {
+  const picked = demos.map((d, i) => [d, i]).filter(([d]) => d.task === $("task").value);
+  $("demoList").replaceChildren(...picked.map(([d, i]) => {
+    const l = el("label"), c = el("input"); c.type = "checkbox"; c.value = i; c.checked = true;
+    l.append(c, document.createTextNode(d.label)); return l;
+  }));
+  const objects = picked.length ? picked[0][0].objects : [];
+  $("object").replaceChildren(...objects.map(o => { const e = el("option", o.key); e.value = o.key; return e; }));
 }
 async function poll() {
   const s = await (await fetch("/api/state")).json();
@@ -499,9 +546,10 @@ async function poll() {
   $("status").textContent = s.busy ? s.busy + "... " + s.status : "";
   if (s.error) $("error").textContent = s.error; else if (s.busy) $("error").textContent = "";
   $("generate").disabled = !!s.busy || !demos.length;
-  $("playback").disabled = !!s.busy || !last || !!last.summary;
+  $("playback").disabled = !!s.busy || !last || !!last.playbacks;
+  $("save").disabled = !!s.busy || !last || !last.playbacks || !!last.saved;
   $("regenerate").disabled = !!s.busy;
-  $("feedbackBox").hidden = !(last && last.summary);
+  $("feedbackBox").hidden = !(last && last.playbacks);
   if (s.version !== shownVersion) {
     shownVersion = s.version;
     $("rounds").replaceChildren(...rounds.map(renderRound).reverse());
@@ -509,11 +557,16 @@ async function poll() {
     $("diffList").replaceChildren(...diffs);
     $("diffs").hidden = !diffs.length;
     $("layout").classList.toggle("has-diffs", diffs.length > 0);
-    if (last && !last.summary) $("feedback").value = "";
+    if (last && !last.playbacks) $("feedback").value = "";
   }
 }
-$("demo").onchange = fillObjects;
-$("generate").onclick = () => { const d = demos[+$("demo").value]; post("/api/generate", {path:d.path, demo_id:d.demo_id, object:$("object").value, model:$("model").value}); };
+$("task").onchange = fillTask;
+$("generate").onclick = () => {
+  const picked = [...document.querySelectorAll("#demoList input:checked")].map(c => demos[+c.value]);
+  if (!picked.length) { $("error").textContent = "pick at least one demo"; return; }
+  post("/api/generate", {demos:picked.map(d => ({path:d.path, demo_id:d.demo_id})), object:$("object").value, model:$("model").value});
+};
+$("save").onclick = () => post("/api/save");
 $("playback").onclick = () => post("/api/playback");
 $("regenerate").onclick = () => post("/api/feedback", {text:$("feedback").value, model:$("model").value});
 (async () => {
@@ -523,8 +576,9 @@ $("regenerate").onclick = () => post("/api/feedback", {text:$("feedback").value,
     const e = el("option", m.has_key ? m.name : m.name + " (no " + m.key_env + ")"); e.value = m.name; e.disabled = !m.has_key; return e;
   }));
   $("model").value = options.default_model;
-  $("demo").replaceChildren(...demos.map((d, i) => { const e = el("option", d.label); e.value = i; return e; }));
-  fillObjects();
+  $("task").replaceChildren(...[...new Set(demos.map(d => d.task))].map(t => { const e = el("option", t); e.value = t; return e; }));
+  $("save").hidden = options.sim !== "robocasa";
+  fillTask();
   if (!demos.length) $("error").textContent = "No demos found. Run: python scripts/download_demos.py --sim " + options.download;
   poll(); setInterval(poll, 1000);
 })();

@@ -61,7 +61,7 @@ def test_requested_model_must_be_known_and_have_a_key(monkeypatch):
     monkeypatch.delenv("CLAUDE_API_KEY", raising=False)
     demo = {"path": "d.hdf5", "demo_id": 0, "task": "pick_egg", "objects": [{"key": "egg", "health_names": []}]}
     app = ui.App("gemini-3.5-flash-lite", 1, 1, [demo], sim="robocasa")
-    ask = {"path": "d.hdf5", "demo_id": 0, "object": "egg"}
+    ask = {"demos": [{"path": "d.hdf5", "demo_id": 0}], "object": "egg"}
 
     code, body = app.generate({**ask, "model": "claude-haiku-5-5"})
     assert code == 400 and "CLAUDE_API_KEY" in body["error"]
@@ -87,22 +87,102 @@ def test_robocasa_playback_cmd_is_sopans(tmp_path):
                        "--param-overrides", str(tmp_path / "params.json"), "--summary-json", str(tmp_path / "s.json")]
 
 
-def test_playback_round_runs_the_sims_command(tmp_path, monkeypatch):
+def test_playback_round_plays_every_demo_and_labels_results(tmp_path, monkeypatch):
     rd = tmp_path / "round1"; rd.mkdir()
-    script = (f"import json,pathlib; r=pathlib.Path({str(rd)!r}); "
-              "assert (r/'playback_data').is_dir(); (r/'playback_data/playback.hdf5').write_text('x'); "
-              "(r/'v.mp4').write_text('v'); "
-              "(r/'playback_summary.json').write_text(json.dumps({'final_health': {'egg': 50.0}, 'peak_forces': {}}))")
-    fake = ui.Sim("robocasa", "robocasa", list, lambda s, d, o, sm: [sys.executable, "-c", script],
+    script = ("import json,pathlib,sys; d=pathlib.Path(sys.argv[1]); "
+              "assert (d/'playback_data').is_dir(); (d/'playback_data/playback.hdf5').write_text('x'); "
+              "(d/'v.mp4').write_text('v'); "
+              "pathlib.Path(sys.argv[2]).write_text(json.dumps({'final_health': {'egg': float(sys.argv[3])}, 'peak_forces': {}}))")
+    fake = ui.Sim("robocasa", "robocasa", list,
+                  lambda s, d, o, sm: [sys.executable, "-c", script, str(d), str(sm), str(s["demo"]["demo_id"] * 50)],
                   lambda d, i: d / "v.mp4")
     monkeypatch.setitem(ui.SIMS, "fake", fake)
-    session = {"sim": "fake", "object": "egg", "demo": {"demo_id": 0},
-               "rounds": [{"params": {"damage_threshold": 1.0}, "run_dir": str(rd), "summary": None, "video": None}]}
-    ui.playback_round(session)
-    r = session["rounds"][0]
-    assert r["summary"]["final_health"] == {"egg": 50.0} and r["video"] == str(rd / "v.mp4")
-    assert not (rd / "playback_data/playback.hdf5").exists()
+    demos = [{"demo_id": 0, "label": "pick_egg_safe / demo_0"}, {"demo_id": 1, "label": "pick_egg_unsafe / demo_1"}]
+    session = {"sim": "fake", "object": "egg", "demos": demos,
+               "rounds": [{"params": {"damage_threshold": 1.0}, "run_dir": str(rd), "playbacks": None}]}
+    lines = []
+    ui.playback_round(session, lines.append)
+    plays = session["rounds"][0]["playbacks"]
+    assert [p["label"] for p in plays] == [d["label"] for d in demos]
+    assert [p["summary"]["final_health"]["egg"] for p in plays] == [0.0, 50.0]
+    assert plays[1]["video"] == str(rd / "demo1/v.mp4")
+    assert not (rd / "demo0/playback_data/playback.hdf5").exists()
     assert json.loads((rd / "params.json").read_text()) == {"egg": {"damage_threshold": 1.0}}
+
+
+def test_feedback_block_reports_each_demo():
+    from damagesim.llm_params import prompts
+    params = {"damage_threshold": 60.0, "damage_scale": 1.0, "impact_damage_sensitivity": 1.0, "qs_damage_sensitivity": 0.2}
+    rounds = [{"params": params, "feedback": "should crack when dropped", "playbacks": [
+        {"label": "pick_egg_safe / demo_0", "summary": {"final_health": {"egg": 100.0}, "peak_forces": {}}},
+        {"label": "pick_egg_unsafe / demo_0", "summary": {"final_health": {"egg": 100.0, "PandaOmron": 90.0},
+                                                          "peak_forces": {"egg": {"impact_forces": 80.0}}}}]}]
+    block = prompts.feedback_block("egg", rounds)
+    assert "Result for egg in demo pick_egg_safe / demo_0: final health 100.0" in block
+    assert "Result for egg in demo pick_egg_unsafe / demo_0: final health 100.0, peak impact force 80.0" in block
+    assert "PandaOmron" not in block
+
+
+def test_tuned_json_overrides_only_saved_objects(tmp_path):
+    from damagesim.llm_params.playback_io import apply_tuned, save_tuned
+    path = tmp_path / "tuned.json"
+    table = {"cup": {"friction": 1, "mechanical": {"damage_threshold": 60.0, "damage_scale": 2.0}},
+             "egg": {"mechanical": {"damage_threshold": 25.0, "damage_scale": 2.5}}}
+    apply_tuned(table, path)  # no file yet: nothing changes
+    assert table["cup"]["mechanical"]["damage_threshold"] == 60.0
+
+    save_tuned("cup", {"damage_threshold": 45.0, "damage_scale": 0.8}, path)
+    save_tuned("bowl", {"damage_threshold": 30.0}, path)
+    save_tuned("cup", {"damage_threshold": 40.0, "damage_scale": 0.8}, path)  # a later save replaces it
+    assert json.loads(path.read_text()) == {"bowl": {"damage_threshold": 30.0},
+                                            "cup": {"damage_threshold": 40.0, "damage_scale": 0.8}}
+
+    del table  # bowl isn't in this table, so use one that has every saved object
+    table = {"cup": {"friction": 1, "mechanical": {"damage_threshold": 60.0, "damage_scale": 2.0}},
+             "bowl": {"mechanical": {"damage_threshold": 50.0}},
+             "egg": {"mechanical": {"damage_threshold": 25.0, "damage_scale": 2.5}}}
+    apply_tuned(table, path)
+    assert table["cup"] == {"friction": 1, "mechanical": {"damage_threshold": 40.0, "damage_scale": 0.8}}
+    assert table["egg"]["mechanical"] == {"damage_threshold": 25.0, "damage_scale": 2.5}
+
+
+def test_robocasa_table_reads_the_tuned_file():
+    import inspect
+    from damagesim.robosuite.params import damage_params
+    assert "apply_tuned(OBJECT_PARAMS)" in inspect.getsource(damage_params)
+
+
+def _app_with_round(monkeypatch, playbacks, sim="robocasa"):
+    app = ui.App("gemini-3.5-flash-lite", 1, 1, [], sim=sim)
+    app.session = {"sim": sim, "object": "egg", "dir": ".", "rounds": [{"params": {"damage_threshold": 9.0},
+                                                                         "playbacks": playbacks}]}
+    saved = []
+    monkeypatch.setattr(ui, "save_params", lambda key, params: saved.append((key, params)))
+    monkeypatch.setattr(app, "_save", lambda: None)
+    return app, saved
+
+
+def test_save_needs_a_played_back_robocasa_round(monkeypatch):
+    app, saved = _app_with_round(monkeypatch, None)
+    assert app.save()[0] == 400 and not saved
+    app, saved = _app_with_round(monkeypatch, [{"label": "x"}], sim="omnigibson")
+    assert app.save()[0] == 400 and not saved
+    app, saved = _app_with_round(monkeypatch, [{"label": "x"}])
+    assert app.save() == (200, {}) and saved == [("egg", {"damage_threshold": 9.0})]
+    assert app.session["rounds"][-1]["saved"]
+
+
+def test_generate_takes_demos_of_one_task(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "x")
+    obj = [{"key": "egg", "health_names": []}]
+    demos = [{"path": "a.hdf5", "demo_id": 0, "task": "pick_egg", "objects": obj, "label": "a"},
+             {"path": "b.hdf5", "demo_id": 0, "task": "serve_pastry", "objects": obj, "label": "b"}]
+    app = ui.App("gemini-3.5-flash-lite", 1, 1, demos, sim="robocasa")
+    ask = {"object": "egg", "model": "gemini-3.5-flash-lite"}
+    assert app.generate({**ask, "demos": []})[0] == 400
+    assert app.generate({**ask, "demos": [{"path": "a.hdf5", "demo_id": 0}, {"path": "b.hdf5", "demo_id": 0}]})[0] == 400
+    assert app.generate({**ask, "demos": [{"path": "zzz.hdf5", "demo_id": 0}]})[0] == 400
+    assert app.session is None
 
 
 B1K_ROWS = gt.export("omnigibson")

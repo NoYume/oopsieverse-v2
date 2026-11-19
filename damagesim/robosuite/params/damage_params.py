@@ -594,6 +594,12 @@ OBJECT_PARAMS = {
     },
 }
 
+# The values above are hand-tuned and are the LLM benchmark's reference. Mechanical params saved from
+# the feedback page live in data/tuned_params.json and replace them here; other objects keep these.
+from damagesim.llm_params.playback_io import apply_tuned  # noqa: E402
+
+apply_tuned(OBJECT_PARAMS)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Helper functions

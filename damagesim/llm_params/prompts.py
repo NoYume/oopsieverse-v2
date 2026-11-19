@@ -35,16 +35,19 @@ def feedback_block(target_key: str, rounds: list[dict], health_names: list[str] 
              "health lost = max(0, D - damage_threshold) * damage_scale. Health starts at 100.", ""]
     for i, r in enumerate(rounds, start=1):
         lines.append(f"Attempt {i}: " + ", ".join(f"{p}={r['params'][p]!r}" for p in PARAM_NAMES))
-        health = (r.get("summary") or {}).get("final_health", {})
-        peaks = (r.get("summary") or {}).get("peak_forces", {})
-        for obj in health_names or [o for o in health if target_key in o.lower()] or list(health):
-            if obj not in health:
-                lines.append(f"Result for {obj}: not recorded")
-                continue
-            f = peaks.get(obj, {})
-            force = lambda key: f"{f[key]:.1f}" if key in f else "not recorded"  # a missing force is not a zero
-            lines.append(f"Result for {obj}: final health {health[obj]:.1f}, peak impact force "
-                         f"{force('impact_forces')}, peak pushing force {force('filtered_qs_forces')}")
+        plays = r.get("playbacks") or [{"label": None, "summary": r.get("summary")}]
+        for play in plays:
+            where = f" in demo {play['label']}" if play["label"] else ""
+            health = (play["summary"] or {}).get("final_health", {})
+            peaks = (play["summary"] or {}).get("peak_forces", {})
+            for obj in health_names or [o for o in health if target_key in o.lower()] or list(health):
+                if obj not in health:
+                    lines.append(f"Result for {obj}{where}: not recorded")
+                    continue
+                f = peaks.get(obj, {})
+                force = lambda key: f"{f[key]:.1f}" if key in f else "not recorded"  # a missing force is not a zero
+                lines.append(f"Result for {obj}{where}: final health {health[obj]:.1f}, peak impact force "
+                             f"{force('impact_forces')}, peak pushing force {force('filtered_qs_forces')}")
         if r.get("feedback"):
             lines.append(f"Human feedback: {r['feedback']}")
         lines.append("")
